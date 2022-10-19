@@ -7,12 +7,11 @@ using LinearAlgebra, QuadGK, Roots, Optim
 using DataFrames, CSV
 using LeastSquaresOptim
 using Polynomials
-using JSON3
+using JSON3, Printf
 include("functions_LUS.jl")
 
 # path = r'C:\Users\TJSEM\Dropbox\Unemployment Stocks II\Python programs'
 # os.chdir(path)
-# from model_class_02222021 import ParamsLUS, ParamsLUSTrans
 using PyCall
 #ENV["PYTHON"] = raw"C:\ProgramData\Anaconda3\python.exe"
 ENV["PYTHON"] = raw"C:\\Users\\Administrator\\anaconda3\\python.exe"
@@ -20,7 +19,7 @@ using Conda
 #Conda.pip_interop(true)
 #Conda.pip("install", "fredapi")
 #Conda.pip("install", "scipy")
-Conda.pip("install", "astropy")
+#Conda.pip("install", "astropy")
 nanmean(x) = mean(filter(!isnan,x))
 nanmean(x,y) = mapslices(nanmean,x,y)
 
@@ -65,19 +64,24 @@ py"""def gen_targets(init='1959', final='2019', replace=0.71, zbar=1,
     spread = KV_data['aaatreas']
     debt_gdp = np.exp(KV_data['lndebtgdp'])
         
-        #stock_cap_gdp = fred.get_series('DDDM01USA156NWDB').resample('A').mean()
+    stock_cap_gdp = fred.get_series('DDDM01USA156NWDB').resample('A').mean()
         #debt_stock = (debt_gdp/stock_cap_gdp).mean()
         #save_object([u_level, e_level, u_new, jf, s, w_hour, weekly_hours, spread, debt_gdp], 'calibration_data')
         
-    ##health share
     
     #A 1% increase in debt to GDP reduces the interest rate spread by 0.746%.
-    out = replace, spread, rho_annual, zbar, jf, s, debt_gdp, mu
+    out = stock_cap_gdp, spread, rho_annual, zbar, jf, s, debt_gdp, mu, replace
     return out
 """
 
 function calibrate(targets)
-    rep = targets[1]
+    # Targets
+    # 1-3) Treasury demand 
+    # 4) Market tightness
+    # 5) Stock market cap to gdp
+    # 6) Labor share of income
+
+    stock_cap_GDP = targets[1].mean()/100
     spread = targets[2].values
     rho_annual = targets[3]
     zbar = targets[4]
@@ -85,6 +89,8 @@ function calibrate(targets)
     s = targets[6].values
     debt_gdp = targets[7].values
     μ = targets[8]
+    #rep = targets[9]
+    rep = 0.6
     """
     a) Construct separation rate, job finding probability using unemployment
        #data, and tightness 
@@ -98,47 +104,54 @@ function calibrate(targets)
     ξ = 0.5
     A = jf_mean/(θ^(1-ξ))
     σ = μ - 1.0
-    ρ = (1+ rho_annual)^(1/12) - 1.0
+    #ρ = (1+ rho_annual)^(1/12) - 1.0
     λ = 0.8
+    #η = 0.7
   
     function Treasury_demand(param, xdata, ydata)
-        k, B, α, w0, ϕ = sqrt.(param.^2)
+        # Extract parameters
+        k, B, α, w0, ϕ, ρ, η = sqrt.(param.^2)
 
         # Monthly debt-to-gdp is scaled up by 12 (since GDP is divided by 12)
         xdata_mon = xdata*12
         spread_list = zeros(size(xdata_mon))
         J_list = similar(spread_list)
         n_list = similar(spread_list)
-        Ag_list = similar(spread_list)
+        Bg_list = similar(spread_list)
         theta_list = similar(spread_list)
         z_list = similar(spread_list)
         w_list = similar(spread_list)
 
         for (i, x) in enumerate(xdata_mon)
 
-            para = ParaCalib2(δ=δ, zbar=zbar, w0=w0, ϕ=ϕ, ρ=ρ, α=α, B=B, σ=σ, k=k, A=A, ξ=ξ, λ=λ)
+            para = ParaCalib2(δ=δ, zbar=zbar, w0=w0, ϕ=ϕ, ρ=ρ, α=α, B=B, σ=σ, k=k, A=A, ξ=ξ, λ=λ, η=η)
             # parameterization consistent with debt-to-GDP ratio
-            para = ParaTrans(0, x, para)
+            para = ParaTrans(x, para, 0)
             # steady state
-            ss = steady_state(0, para)
-            spread_list[i] = ss.spread*100*12
+            ss = SteadyState(para, 0)
+            spread_list[i] = ss.spread_bond*100*12
             J_list[i] = ss.J 
             n_list[i] = ss.n 
-            Ag_list[i] = para.Ag 
+            Bg_list[i] = para.Bg
             theta_list[i] = ss.θ
             z_list[i] = ss.z 
             w_list[i] = ss.w
          end
 
         # convert spread to annualized percentage points
-        out = zeros(5)
+        out = zero(param)
         # Distance between model spread and data
         out[1:3] = (spread_list-ydata)./ydata
         # Distance from market tightness to target
         out[4] = (theta_list[2] - θ)/θ
         # Distance from outside option and revenue
         out[5] = (rep*z_list[2]-w0)/w0
-        return out, Ag_list[2]
+        #Labor share
+        #out[5] = (w_list[2]/z_list[2]-0.64)/0.64
+        #out[5] = (ϕ*z_list[2]/w_list[2]-0.5)
+        # Stock market cap to GDP
+        out[6] = J_list[2]/(12*z_list[2]) - stock_cap_GDP    
+        return out, Bg_list[2]
     end
 
     # Quadratic fit to K_V data
@@ -156,17 +169,17 @@ function calibrate(targets)
 
     py"""
     res = least_squares(fun=$Treasury_demand_bas, 
-                    x0=np.array((4.41, 16.65, 0.004448, 0.7186, 0.04702)),
-         verbose=2, max_nfev=150, x_scale='jac', method='dogbox',
-        bounds = ((0, 0, 0, 0, 0), (np.inf, np.inf, 0.99, np.inf, 0.99) ),
-        ftol=1e-8/3, xtol=1e-8/3)
+                    x0=np.array((9.21, 16.68, 0.00446, 0.62, 0.4, 0.00341, 0.4815)),
+         verbose=2, max_nfev=150, x_scale='jac', method='trf',
+        bounds = ((0, 0, 0, 0.6, 0.0, 0.02/12, 0), (np.inf, np.inf, 0.99, np.inf, 0.99, 0.006, 0.99) ),
+        ftol=1e-9, xtol=1e-9)
+
     #save_object(res, "optimization_object_ext")
     """
     params_opt = py"res.x"
-    k, B, α, w0, ϕ = params_opt
-    out, Ag = Treasury_demand(params_opt, xdata, ydata)
-    params = ParaCalib2(δ=δ, zbar=zbar, w0=w0, ϕ=ϕ, ρ=ρ, α=α, B=B, σ=σ, k=k, A=A, ξ=ξ, λ=λ, Ag=Ag)
-
+    k, B, α, w0, ϕ, ρ, η = params_opt
+    out, Bg = Treasury_demand(params_opt, xdata, ydata)
+    params = ParaCalib2(δ=δ, zbar=zbar, w0=w0, ϕ=ϕ, ρ=ρ, α=α, B=B, σ=σ, k=k, A=A, ξ=ξ, λ=λ, Bg=Bg, η=η)
 
     return params, poly_fit
 end
@@ -179,9 +192,9 @@ function plot_Treasury_demand(params, debt_gdp, spread, poly_fit)
 
     for (i, x) in enumerate(xdata_mon)
         # Instantiate ParamsLUStrans
-        para = ParaTrans(0, x, params)
-        ss = steady_state(0, para)
-        spread_list[i] = ss.spread*100*12
+        para = ParaTrans(x, params, 0)
+        ss = SteadyState(para, 0)
+        spread_list[i] = ss.spread_bond*100*12
         end
 
     fig, ax = subplots()
@@ -196,41 +209,14 @@ function plot_Treasury_demand(params, debt_gdp, spread, poly_fit)
     ax.set_title("Treasury demand curve")
     display(fig)
     #PyPlot.savefig("/Users/BIZtech/Dropbox/Unemployment Stocks II/latest draft/figs/Treasury_demand_curve.pdf")
+    PyPlot.savefig("/Users/TJSEM/Dropbox/Unemployment Stocks II/latest draft/figs/Treasury_demand_curve.pdf")
     end
-
-function main()
-    targets = py"gen_targets()"
-
-    # open("targets.json", "w") do io
-    #     JSON3.pretty(io, targets)
-    # end
-
-    params, poly_fit = calibrate(targets)
-
-    spread = targets[2].values
-    debt_gdp = targets[7].values
-
-    plot_Treasury_demand(params, debt_gdp, spread, poly_fit)
-
-    # Save output
-    @unpack δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Ag, λ, γ = params
-    tab = [δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Ag, λ, γ]
-
-    open("params_calib.json", "w") do io
-        JSON3.pretty(io, tab)
-    end
-end
-
-main()
-json_string = read("params_calib.json", String)
-par = JSON3.read(json_string)
-δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Ag, λ, γ = par
 
 py"""def Tab(params):
-        δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Ag, λ, γ = params
-        params = [δ, zbar, w0, ϕ, ρ, α, B, σ, k, A, ξ, Ag, λ]
+        δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Bg, λ, η = params
+        params = [δ, zbar, w0, ϕ, ρ, α, B, σ, k, A, ξ, Bg, λ, η]
         names =['$\\delta$' , '$\overline{z}$', '$w_0$', '$\\phi$', '$\\rho$', '$\\alpha$',
-                '$B$', '$\\sigma$', '$k$', '$A$', '$\\xi$', '$A^g$', '$\\lambda$']
+                '$B$', '$\\sigma$', '$k$', '$A$', '$\\xi$', '$B^g$', '$\\lambda$', '$\\eta$']
         strat=['mean separation rate', 
             'normalization',
             'replacement ratio', 
@@ -243,7 +229,8 @@ py"""def Tab(params):
             'Job finding rate',
             ' Elasticity of matching function with respect to unemployment ',
             'Treasury demand',
-            'Fraction of HH with access to credit']
+            'Fraction of HH with access to credit',
+            'Treasury demand']
         t = Table([names, tuple(params), strat], names=('Parameter','Values', 'Calibration Strategy')
         )
         t['Values'].format='0.4g'
@@ -252,12 +239,43 @@ py"""def Tab(params):
         return t  
     """
 
-tab = py"Tab($par)"
-para = ParaCalib2()
-ss = steady_state(0, para)
-@unpack n, J, spread, w, z, M = ss
-ss.spread*12*100
-L = M+Ag
-labor_share = w/z
-private_share = M/(M+Ag)
+targets = py"gen_targets()"
 
+# open("targets.json", "w") do io
+#     JSON3.pretty(io, targets)
+# end
+
+params, poly_fit = calibrate(targets)
+
+spread = targets[2].values
+debt_gdp = targets[7].values
+
+plot_Treasury_demand(params, debt_gdp, spread, poly_fit)
+
+@unpack δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Bg, λ, η = params
+
+para = ParaCalib2(w0=w0,ϕ=ϕ, ρ=ρ, α=α, B=B, σ=σ, k=k, A=A, Bg=Bg, λ=λ, η=η)
+ss = SteadyState(para, 0)
+@unpack n, J, spread_bond, spread_equity, r_a, r_b, w, z, M, w, z, θ = ss
+
+@printf "\n Bond spread =  %.4f" spread_bond*12*100
+@printf "\n Equity spread = %.4f" spread_equity*12*100
+@printf "\n Annual rate on illiquid bond = %.4f" ρ*12*100
+@printf "\n Labor share of income = %.2f" w/z
+@printf "\n Stock market cap to GDP = %.2f" J/(12*z)
+@printf "\n Debt to GDP = %.2f" Bg/(12*z)
+@show 12*100(spread_bond-spread_equity)
+
+
+# Save output
+tab = [δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Bg, λ, η]
+
+open("params_calib.json", "w") do io
+    JSON3.pretty(io, tab)
+end
+json_string = read("params_calib.json", String)
+par = JSON3.read(json_string)
+δ, zbar, w0, w1, ϕ, ρ, α, B, σ, k, A, ξ, Bg, λ, η = par
+
+
+tab = py"Tab($tab)"
